@@ -7,6 +7,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:wght@300;400;500&family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 :root {
   --bg:#0a0a0a; --surface:#111; --surface2:#161616; --border:#252525;
@@ -498,8 +499,13 @@ select option{background:var(--bg);}
 <div class="toast" id="toast"></div>
 
 <script>
+// ─── SUPABASE ─────────────────────────────────────────────────────────────────
+const SUPA_URL = 'https://eszylrocrhriyplvbatc.supabase.co';
+const SUPA_KEY = 'sb_publishable_jPVt9MGRq39Jcdo-Q5y6CA_X_eNj6W4';
+const sb = supabase.createClient(SUPA_URL, SUPA_KEY);
+
 // ─── STATE ────────────────────────────────────────────────────────────────────
-let sessions = JSON.parse(localStorage.getItem('isiah_v3') || '[]');
+let sessions = [];
 let goals = JSON.parse(localStorage.getItem('isiah_goals') || '{"total":null,"weekly":null}');
 let pending = null;
 let pendingCoords = null;
@@ -507,12 +513,45 @@ let activeFilter = 'all';
 let previewMap = null;
 let modalMap = null;
 
-const saveS = () => localStorage.setItem('isiah_v3', JSON.stringify(sessions));
+// Goals still use localStorage (simple key/value, no need for DB)
 const saveG = () => localStorage.setItem('isiah_goals', JSON.stringify(goals));
 
-document.getElementById('f-date').valueAsDate = new Date();
-document.getElementById('today-date').textContent =
-  new Date().toLocaleDateString('en-AU',{weekday:'short',day:'numeric',month:'short',year:'numeric'}).toUpperCase();
+// ─── DB FUNCTIONS ─────────────────────────────────────────────────────────────
+async function loadSessions() {
+  showDBStatus('LOADING…');
+  const { data, error } = await sb.from('sessions').select('*').order('date', { ascending: false });
+  if (error) { showDBStatus('ERROR LOADING — CHECK CONSOLE'); console.error(error); return; }
+  // Map DB columns to app format
+  sessions = data.map(r => ({
+    id: r.id, type: r.type, date: r.date,
+    dist: parseFloat(r.dist)||0, dur: r.dur||0, elev: r.elev||0, hr: r.hr||0,
+    notes: r.notes||'', source: r.source||'manual', coords: r.coords||[]
+  }));
+  hideDBStatus();
+  renderAll();
+}
+
+async function saveSession(s) {
+  const { data, error } = await sb.from('sessions').insert([{
+    type: s.type, date: s.date, dist: s.dist, dur: s.dur,
+    elev: s.elev, hr: s.hr, notes: s.notes, source: s.source, coords: s.coords
+  }]).select().single();
+  if (error) { toast('SAVE FAILED — CHECK CONNECTION'); console.error(error); return null; }
+  return data;
+}
+
+async function deleteSessionDB(id) {
+  const { error } = await sb.from('sessions').delete().eq('id', id);
+  if (error) { toast('DELETE FAILED'); console.error(error); return false; }
+  return true;
+}
+
+function showDBStatus(msg) {
+  let el = document.getElementById('db-status');
+  if (!el) { el = document.createElement('div'); el.id='db-status'; el.style.cssText='position:fixed;top:16px;left:50%;transform:translateX(-50%);background:var(--surface);border:1px solid var(--border);font-family:var(--fm);font-size:10px;letter-spacing:2px;color:var(--muted2);padding:8px 18px;z-index:9999;text-transform:uppercase;'; document.body.appendChild(el); }
+  el.textContent = msg; el.style.display='block';
+}
+function hideDBStatus() { const el=document.getElementById('db-status'); if(el) el.style.display='none'; }
 
 // ─── AVATAR ───────────────────────────────────────────────────────────────────
 const avatarInput = document.getElementById('avatar-input');
@@ -655,14 +694,19 @@ function showPreview(data) {
   }
 }
 
-function confirmImport() {
+async function confirmImport() {
   if (!pending) return;
-  sessions.unshift({id:Date.now(),type:document.getElementById('prev-type').value,
+  const s = {type:document.getElementById('prev-type').value,
     date:pending.date||new Date().toISOString().split('T')[0],
-    dist:pending.dist,dur:pending.durMin,elev:pending.elevGain,hr:pending.avgHR,
-    notes:document.getElementById('prev-notes').value.trim(),source:pending.source,
-    coords:pending.coords||[]});
-  saveS(); renderAll(); cancelImport(); toast('SESSION IMPORTED ✓'); fi.value='';
+    dist:pending.dist, dur:pending.durMin, elev:pending.elevGain, hr:pending.avgHR,
+    notes:document.getElementById('prev-notes').value.trim(), source:pending.source,
+    coords:pending.coords||[]};
+  toast('SAVING…');
+  const saved = await saveSession(s);
+  if (saved) {
+    sessions.unshift({...s, id:saved.id});
+    renderAll(); cancelImport(); toast('SESSION IMPORTED ✓'); fi.value='';
+  }
 }
 
 function cancelImport() {
@@ -676,18 +720,28 @@ function cancelImport() {
 
 // ─── MANUAL LOG ───────────────────────────────────────────────────────────────
 function toggleManual(){document.getElementById('manual-form').classList.toggle('open');}
-function logManual(){
+async function logManual(){
   const date=document.getElementById('f-date').value;
   if(!date){alert('Pick a date!');return;}
-  sessions.unshift({id:Date.now(),type:document.getElementById('f-type').value,date,
-    dist:+document.getElementById('f-dist').value||0,dur:+document.getElementById('f-dur').value||0,
-    elev:+document.getElementById('f-elev').value||0,hr:+document.getElementById('f-hr').value||0,
-    notes:document.getElementById('f-notes').value.trim(),source:'manual',coords:[]});
-  saveS();renderAll();toast('SESSION LOGGED ✓');
-  ['f-dist','f-dur','f-elev','f-hr','f-notes'].forEach(id=>document.getElementById(id).value='');
+  const s={type:document.getElementById('f-type').value, date,
+    dist:+document.getElementById('f-dist').value||0, dur:+document.getElementById('f-dur').value||0,
+    elev:+document.getElementById('f-elev').value||0, hr:+document.getElementById('f-hr').value||0,
+    notes:document.getElementById('f-notes').value.trim(), source:'manual', coords:[]};
+  toast('SAVING…');
+  const saved = await saveSession(s);
+  if (saved) {
+    sessions.unshift({...s, id:saved.id});
+    renderAll(); toast('SESSION LOGGED ✓');
+    ['f-dist','f-dur','f-elev','f-hr','f-notes'].forEach(id=>document.getElementById(id).value='');
+  }
 }
 
-function deleteSession(id,e){e.stopPropagation();sessions=sessions.filter(s=>s.id!==id);saveS();renderAll();}
+async function deleteSession(id,e){
+  e.stopPropagation();
+  if (!confirm('Delete this session?')) return;
+  const ok = await deleteSessionDB(id);
+  if (ok) { sessions=sessions.filter(s=>s.id!==id); renderAll(); toast('SESSION DELETED'); }
+}
 
 // ─── MAP MODAL ────────────────────────────────────────────────────────────────
 function openMap(id) {
@@ -951,7 +1005,12 @@ function switchTab(name){
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2800);}
 
 function renderAll(){renderHome();renderImportRecent();renderHistory();}
-renderAll();
+
+// ─── INIT ─────────────────────────────────────────────────────────────────────
+document.getElementById('f-date').valueAsDate = new Date();
+document.getElementById('today-date').textContent =
+  new Date().toLocaleDateString('en-AU',{weekday:'short',day:'numeric',month:'short',year:'numeric'}).toUpperCase();
+loadSessions();
 </script>
 </body>
 </html>
